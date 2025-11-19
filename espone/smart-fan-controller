@@ -1,0 +1,183 @@
+esphome:
+  name: smart-fan-controller
+  friendly_name: Smart Fan Controller
+
+esp8266:
+  board: d1_mini   # Cambia in nodemcuv2 se usi NodeMCU
+
+# Configurazione Wi-Fi (metti i tuoi dati)
+wifi:
+  ssid: "NOME_WIFI"
+  password: "PASSWORD_WIFI"
+
+  # opzionale: fallback AP se il Wi-Fi non va
+  ap:
+    ssid: "SmartFanFallback"
+    password: "12345678"
+
+# Integrazione con Home Assistant
+api:
+
+ota:
+logger:
+
+# ─────────────────────────────────────────────
+# SENSORI: DHT11 + RPM VENTOLA
+# ─────────────────────────────────────────────
+
+sensor:
+  # Sensore DHT11 (temperatura + umidità)
+  - platform: dht
+    pin: D2                # PIN collegato al DHT11
+    model: DHT11
+    temperature:
+      name: "Temperatura Ambiente"
+      id: temp_ambiente
+    humidity:
+      name: "Umidità Ambiente"
+      id: hum_ambiente
+    update_interval: 10s
+
+  # Tachimetro ventola (RPM)
+  # Filo tach collegato a D5 (con resistenza/condensatore per pulire il segnale)
+  - platform: pulse_counter
+    pin: D5
+    name: "Ventola RPM"
+    id: fan_rpm
+    unit_of_measurement: "rpm"
+    update_interval: 5s
+    # Per molte ventole PC: 2 impulsi per giro
+    filters:
+      - multiply: 30.0   # (impulsi/s) * 60 / 2 = x * 30
+
+# ─────────────────────────────────────────────
+# USCITE: PWM VENTOLA + RELÈ ALIMENTAZIONE
+# ─────────────────────────────────────────────
+
+output:
+  # Uscita PWM per il filo PWM della ventola (blu)
+  - platform: esp8266_pwm
+    id: fan_pwm_out
+    pin: D1           # PIN collegato al filo PWM della ventola
+    frequency: 25000  # Frequenza tipica per ventole PC (25 kHz)
+
+# Relè che stacca/attacca i 12V della ventola
+switch:
+  - platform: gpio
+    name: "Relè Ventola"
+    id: fan_relay
+    pin: D6          # PIN collegato al relay (IN)
+    restore_mode: ALWAYS_ON   # opzionale: il relay torna ON al riavvio
+
+# ─────────────────────────────────────────────
+# FAN ENTITY PER HOME ASSISTANT
+# ─────────────────────────────────────────────
+
+fan:
+  - platform: speed
+    name: "Ventola PWM"
+    id: smart_fan
+    output: fan_pwm_out
+    speed_count: 3   # 3 velocità (bassa/media/alta)
+    on_turn_on:
+      - if:
+          condition:
+            switch.is_off: fan_relay
+          then:
+            - switch.turn_on: fan_relay
+    on_turn_off:
+      - switch.turn_off: fan_relay
+
+# ─────────────────────────────────────────────
+# NUMBER / SLIDER PER TEMPERATURE TARGET (AUTO)
+# ─────────────────────────────────────────────
+
+number:
+  - platform: template
+    name: "Temperatura Min Ventola"
+    id: temp_min
+    optimistic: true
+    initial_value: 24
+    min_value: 15
+    max_value: 40
+    step: 0.5
+    unit_of_measurement: "°C"
+
+  - platform: template
+    name: "Temperatura Max Ventola"
+    id: temp_max
+    optimistic: true
+    initial_value: 30
+    min_value: 20
+    max_value: 50
+    step: 0.5
+    unit_of_measurement: "°C"
+
+# ─────────────────────────────────────────────
+# SELECT: Modalità Automatica / Manuale
+# ─────────────────────────────────────────────
+
+select:
+  - platform: template
+    name: "Modalità Ventola"
+    id: fan_mode
+    optimistic: true
+    options:
+      - "Manuale"
+      - "Automatica"
+    initial_option: "Automatica"
+
+# ─────────────────────────────────────────────
+# AUTOMAZIONE DI CONTROLLO (LOGICA BASE)
+# ─────────────────────────────────────────────
+
+interval:
+  - interval: 15s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(fan_mode).state == "Automatica";
+          then:
+            - script.execute: auto_fan_logic
+
+script:
+  - id: auto_fan_logic
+    then:
+      - lambda: |-
+          float t = id(temp_ambiente).state;
+          float tmin = id(temp_min).state;
+          float tmax = id(temp_max).state;
+
+          // Se il sensore non è valido, non fare nulla
+          if (isnan(t) || isnan(tmin) || isnan(tmax)) {
+            return;
+          }
+
+          // Sotto la soglia minima: ventola spenta
+          if (t <= tmin) {
+            id(smart_fan).turn_off();
+            return;
+          }
+
+          // Sopra la soglia massima: velocità massima
+          if (t >= tmax) {
+            id(smart_fan).turn_on();
+            id(smart_fan).set_speed(3);  // alta
+            return;
+          }
+
+          // Tra min e max: modula la velocità (3 step)
+          float range = tmax - tmin;
+          float rel = (t - tmin) / range;  // 0.0 → 1.0
+
+          if (rel < 0.33f) {
+            id(smart_fan).turn_on();
+            id(smart_fan).set_speed(1);    // bassa
+          } else if (rel < 0.66f) {
+            id(smart_fan).turn_on();
+            id(smart_fan).set_speed(2);    // media
+          } else {
+            id(smart_fan).turn_on();
+            id(smart_fan).set_speed(3);    // alta
+          }
